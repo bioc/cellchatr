@@ -1,12 +1,4 @@
-#' Return string `"Hello world!"` to R.
-
 # nolint start
-
-#' @return A character string "Hello world!"
-#' @examples
-#' hello_world()
-#' @export
-hello_world <- function() .Call(wrap__hello_world)
 
 #' Filter expression matrix genes to only those present in CellChatDB.
 #'
@@ -27,6 +19,11 @@ hello_world <- function() .Call(wrap__hello_world)
 rust_subset_genes <- function(expr_genes, db_genes) .Call(wrap__rust_subset_genes, expr_genes, db_genes)
 
 #' Identify over-expressed genes per cell type using Wilcoxon rank-sum test.
+#'
+#' For each gene and each cell type, a one-sided ("greater") Wilcoxon
+#' rank-sum test compares the cells of that type against all other cells,
+#' using the normal approximation with tie correction. A gene is returned
+#' if it is significantly higher in at least one cell type.
 #'
 #' # Complexity
 #' - Time:  O((g/p) x k x c log c) where g = genes, p = CPU cores,

@@ -2,16 +2,6 @@ use extendr_api::prelude::*;
 use std::collections::HashSet;
 use rayon::prelude::*;
 
-/// Return string `"Hello world!"` to R.
-/// @return A character string "Hello world!"
-/// @examples
-/// hello_world()
-/// @export
-#[extendr]
-fn hello_world() -> &'static str {
-    "Hello world!"
-}
-
 /// Filter expression matrix genes to only those present in CellChatDB.
 ///
 /// # Complexity
@@ -39,6 +29,11 @@ fn rust_subset_genes(expr_genes: Vec<String>, db_genes: Vec<String>) -> Vec<Stri
 
 /// Identify over-expressed genes per cell type using Wilcoxon rank-sum test.
 ///
+/// For each gene and each cell type, a one-sided ("greater") Wilcoxon
+/// rank-sum test compares the cells of that type against all other cells,
+/// using the normal approximation with tie correction. A gene is returned
+/// if it is significantly higher in at least one cell type.
+///
 /// # Complexity
 /// - Time:  O((g/p) x k x c log c) where g = genes, p = CPU cores,
 ///          k = cell types, c = cells
@@ -62,9 +57,22 @@ fn rust_wilcoxon_filter(
     labels: Vec<String>,
     gene_names: Vec<String>,
     pval_threshold: f64,
-) -> Vec<String> {
+) -> extendr_api::Result<Vec<String>> {
     let ngenes = counts.nrows();
     let ncells = counts.ncols();
+
+    if labels.len() != ncells {
+        return Err(Error::Other(format!(
+            "length(labels) ({}) must equal ncol(counts) ({})",
+            labels.len(), ncells
+        )));
+    }
+    if gene_names.len() != ngenes {
+        return Err(Error::Other(format!(
+            "length(gene_names) ({}) must equal nrow(counts) ({})",
+            gene_names.len(), ngenes
+        )));
+    }
 
     let cell_types: Vec<String> = {
         let mut seen = HashSet::new();
@@ -73,7 +81,7 @@ fn rust_wilcoxon_filter(
 
     let data: Vec<f64> = counts.data().to_vec();
 
-    (0..ngenes)
+    Ok((0..ngenes)
         .into_par_iter()
         .filter_map(|gene_idx| {
             let gene_expr: Vec<f64> = (0..ncells)
@@ -101,7 +109,7 @@ fn rust_wilcoxon_filter(
             }
             None
         })
-        .collect()
+        .collect())
 }
 
 /// Match overexpressed genes against CellChatDB ligand-receptor pairs.
@@ -130,20 +138,27 @@ fn rust_match_lr_pairs(
     lr_ligands: Vec<String>,
     lr_receptors: Vec<String>,
     lr_names: Vec<String>,
-) -> Vec<String> {
+) -> extendr_api::Result<Vec<String>> {
+    if lr_ligands.len() != lr_names.len() || lr_receptors.len() != lr_names.len() {
+        return Err(Error::Other(
+            "lr_ligands, lr_receptors and lr_names must have the same length".to_string(),
+        ));
+    }
+
     let oe_set: HashSet<String> = overexpressed.into_iter().collect();
 
-    lr_ligands.iter()
+    Ok(lr_ligands.iter()
         .zip(lr_receptors.iter())
         .zip(lr_names.iter())
         .filter(|((lig, rec), _)| {
             oe_set.contains(*lig) || oe_set.contains(*rec)
         })
         .map(|((_, _), name)| name.clone())
-        .collect()
+        .collect())
 }
 
-// Wilcoxon rank-sum test with tie correction
+// One-sided ("greater") Wilcoxon rank-sum test with tie correction:
+// tests whether values in x tend to be larger than values in y.
 // Complexity: O(c log c) where c = total cells (dominated by sort)
 fn wilcoxon_pval(x: &[f64], y: &[f64]) -> f64 {
     let n1 = x.len() as f64;
@@ -153,7 +168,7 @@ fn wilcoxon_pval(x: &[f64], y: &[f64]) -> f64 {
         .chain(y.iter().map(|&v| (v, 1)))
         .collect();
 
-    combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    combined.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let n = combined.len();
 
@@ -203,7 +218,7 @@ fn wilcoxon_pval(x: &[f64], y: &[f64]) -> f64 {
     if std_u == 0.0 { return 1.0; }
 
     let z = (u - mean_u) / std_u;
-    2.0 * (1.0 - normal_cdf(z.abs()))
+    1.0 - normal_cdf(z)
 }
 
 fn normal_cdf(x: f64) -> f64 {
@@ -223,7 +238,6 @@ fn erf(x: f64) -> f64 {
 
 extendr_module! {
     mod cellchatr;
-    fn hello_world;
     fn rust_subset_genes;
     fn rust_wilcoxon_filter;
     fn rust_match_lr_pairs;

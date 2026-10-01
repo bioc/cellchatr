@@ -119,3 +119,125 @@ test_that("rust_match_lr_pairs: all interactions match", {
   result <- rust_match_lr_pairs(oe, ligs, recs, names)
   expect_equal(length(result), 2)
 })
+
+test_that("rust_wilcoxon_filter: one-sided, under-expressed genes not reported", {
+  # gene is strongly LOW in A (two-sided p ~ 4e-21) while B and C are
+  # only moderately higher than the rest (one-sided p ~ 1e-6)
+  counts <- matrix(c(rep(0, 30), rep(5, 60)), nrow = 1)
+  labels <- rep(c("A", "B", "C"), each = 30)
+  result <- rust_wilcoxon_filter(counts, labels, "GENE1", 1e-10)
+  expect_equal(result, character(0))
+})
+
+test_that("rust_wilcoxon_filter: agrees with wilcox.test", {
+  set.seed(1)
+  counts <- matrix(rnorm(40 * 60), nrow = 40)
+  counts[1:5, 1:30] <- counts[1:5, 1:30] + 1.5
+  labels <- rep(c("A", "B"), each = 30)
+  genes  <- paste0("G", 1:40)
+  expected <- genes[vapply(seq_len(nrow(counts)), function(g) {
+    any(vapply(c("A", "B"), function(ct) {
+      wilcox.test(counts[g, labels == ct], counts[g, labels != ct],
+                  alternative = "greater", exact = FALSE,
+                  correct = FALSE)$p.value < 0.05
+    }, logical(1)))
+  }, logical(1))]
+  expect_setequal(rust_wilcoxon_filter(counts, labels, genes, 0.05), expected)
+})
+
+test_that("rust functions error on mismatched lengths", {
+  counts <- matrix(1, nrow = 2, ncol = 4)
+  expect_error(rust_wilcoxon_filter(counts, c("A", "B"), c("G1", "G2"), 0.05),
+               "length\\(labels\\)")
+  expect_error(rust_wilcoxon_filter(counts, rep("A", 4), "G1", 0.05),
+               "length\\(gene_names\\)")
+  expect_error(rust_match_lr_pairs("A", c("A", "B"), "R", "A_R"),
+               "same length")
+})
+
+# ── Bioconductor interface ───────────────────────────────────
+
+make_data <- function() {
+  set.seed(42)
+  genes <- c("TGFB1", "TGFBR1", "VEGFA", "FLT1", paste0("G", 1:20))
+  ct    <- rep(c("Fib", "Endo"), each = 30)
+  mat   <- matrix(rnorm(length(genes) * 60, mean = 1), nrow = length(genes),
+                  dimnames = list(genes, paste0("c", 1:60)))
+  mat["TGFB1", ct == "Fib"] <- 6
+  lrdb <- data.frame(
+    interaction_name = c("TGFB1_TGFBR1", "VEGFA_FLT1"),
+    ligand           = c("TGFB1", "VEGFA"),
+    receptor         = c("TGFBR1", "FLT1"),
+    pathway_name     = c("TGFb", "VEGF"))
+  list(mat = mat, ct = ct, lrdb = lrdb)
+}
+
+test_that("findOverexpressedGenes works on matrices", {
+  d <- make_data()
+  oe <- findOverexpressedGenes(d$mat, d$ct, lrdb = d$lrdb,
+                               pval_threshold = 1e-6)
+  expect_equal(oe, "TGFB1")
+  # lrdb restricts to L-R genes
+  all_oe <- findOverexpressedGenes(d$mat, d$ct, pval_threshold = 1)
+  expect_true(all(oe %in% all_oe))
+  expect_true(all(findOverexpressedGenes(d$mat, d$ct, lrdb = d$lrdb,
+    pval_threshold = 1) %in% c(d$lrdb$ligand, d$lrdb$receptor)))
+})
+
+test_that("findOverexpressedGenes works on sparse matrices", {
+  skip_if_not_installed("Matrix")
+  d <- make_data()
+  sp <- Matrix::Matrix(pmax(d$mat, 0), sparse = TRUE)
+  expect_equal(
+    findOverexpressedGenes(sp, d$ct, pval_threshold = 1e-6),
+    findOverexpressedGenes(as.matrix(sp), d$ct, pval_threshold = 1e-6))
+})
+
+test_that("findOverexpressedGenes works on SummarizedExperiment / SCE", {
+  skip_if_not_installed("SingleCellExperiment")
+  d <- make_data()
+  sce <- SingleCellExperiment::SingleCellExperiment(
+    assays = list(logcounts = d$mat),
+    colData = S4Vectors::DataFrame(cell_type = d$ct))
+  expected <- findOverexpressedGenes(d$mat, d$ct, pval_threshold = 1e-6)
+  expect_equal(findOverexpressedGenes(sce, labels = "cell_type",
+                                      pval_threshold = 1e-6), expected)
+  expect_equal(findOverexpressedGenes(sce, labels = d$ct,
+                                      pval_threshold = 1e-6), expected)
+  expect_error(findOverexpressedGenes(sce, labels = "nope"), "colData")
+  expect_error(findOverexpressedGenes(sce, labels = "cell_type",
+                                      assay.type = "counts"), "not found")
+})
+
+test_that("findOverexpressedGenes validates input", {
+  d <- make_data()
+  expect_error(findOverexpressedGenes(unname(d$mat), d$ct), "row names")
+  expect_error(findOverexpressedGenes(d$mat, d$ct[-1]), "ncol")
+  bad <- d$mat
+  bad[1, 1] <- NA
+  expect_error(findOverexpressedGenes(bad, d$ct), "NA")
+})
+
+test_that("matchLRPairs returns a DataFrame with all columns", {
+  d <- make_data()
+  res <- matchLRPairs("FLT1", d$lrdb)
+  expect_s4_class(res, "DataFrame")
+  expect_equal(res$interaction_name, "VEGFA_FLT1")
+  expect_true("pathway_name" %in% colnames(res))
+  expect_equal(nrow(matchLRPairs(character(0), d$lrdb)), 0L)
+  expect_error(matchLRPairs("A", d$lrdb[, c("ligand", "receptor")]),
+               "interaction_name")
+})
+
+test_that("identifyInteractions runs the full workflow", {
+  skip_if_not_installed("SingleCellExperiment")
+  d <- make_data()
+  sce <- SingleCellExperiment::SingleCellExperiment(
+    assays = list(logcounts = d$mat),
+    colData = S4Vectors::DataFrame(cell_type = d$ct))
+  res <- identifyInteractions(sce, d$lrdb, labels = "cell_type",
+                              pval_threshold = 1e-6)
+  expect_s4_class(res, "DataFrame")
+  expect_equal(res$interaction_name, "TGFB1_TGFBR1")
+  expect_equal(S4Vectors::metadata(res)$overexpressed, "TGFB1")
+})

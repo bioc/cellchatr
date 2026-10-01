@@ -19,7 +19,10 @@ rust_wilcoxon_filter(counts, labels, gene_names, pval_threshold)
 Character vector of over-expressed gene names.
 }
 \description{
-Identify over-expressed genes per cell type using Wilcoxon rank-sum test.
+For each gene and each cell type, a one-sided ("greater") Wilcoxon
+rank-sum test compares the cells of that type against all other cells,
+using the normal approximation with tie correction. A gene is returned
+if it is significantly higher in at least one cell type.
 }
 \section{Complexity}{
 \itemize{

@@ -4,3 +4,9 @@ src/Makevars
 src/Makevars.win
 inst/doc
 *.BiocCheck
+*.Rcheck
+*.tar.gz
+.Rhistory
+src/rust/target
+src/*.o
+src/*.so

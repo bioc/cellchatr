@@ -1,14 +1,26 @@
-# cellchatr 0.1.0
+# cellchatr 0.99.1
 
-## New Features
+## Bioconductor review changes
 
-* `rust_subset_genes()` — HashSet-based gene filtering, O(n+m) vs R's O(n×m)
-* `rust_wilcoxon_filter()` — parallel Wilcoxon rank-sum test with tie correction
-  using Rayon, 183x faster than base R on 2,000 genes × 200 cells
-* `rust_match_lr_pairs()` — HashSet-based ligand-receptor pair matching
+* Added Bioconductor-interoperable API:
+  - `findOverexpressedGenes()` S4 generic with methods for matrices
+    (dense or sparse) and `SummarizedExperiment` / `SingleCellExperiment`
+    objects (`assay.type` and a `colData` column for cell labels).
+  - `matchLRPairs()` returns matching interactions as an
+    `S4Vectors::DataFrame`.
+  - `identifyInteractions()` runs the full workflow in one call.
+* Removed the `hello_world()` scaffold function.
+* `rust_wilcoxon_filter()` now computes a one-sided ("greater") p-value,
+  as documented; previously it was two-sided and also reported
+  under-expressed genes.
+* `rust_wilcoxon_filter()` and `rust_match_lr_pairs()` now raise an R
+  error for inputs of mismatched lengths instead of panicking.
+* CellChat is no longer referred to as a dependency: any ligand-receptor
+  table can be used, and the CellChatDB interaction table is supported
+  directly.
 
-## Validation
+# cellchatr 0.99.0
 
-* All three functions validated on real `CellChatDB.human` (3,233 interactions)
-* 16 unit tests — all passing
-* R CMD check — zero errors, zero warnings
+* Initial Bioconductor submission.
+* `rust_subset_genes()`, `rust_wilcoxon_filter()` and
+  `rust_match_lr_pairs()` implemented in Rust.

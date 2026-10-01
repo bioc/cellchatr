@@ -1,32 +1,39 @@
 Package: cellchatr
-Title: Fast CellChat Database Querying Backed by Rust
-Version: 0.99.0
+Title: Fast Ligand-Receptor Interaction Screening for Single-Cell Data Using Rust
+Version: 0.99.1
 Authors@R: 
     person("Mayank", "Gandhi", , "135.mayankgandhi@gmail.com", role = c("aut", "cre"),
            comment = c(ORCID = "0009-0000-3448-9308"))
-Description: Accelerates three bottleneck steps in the CellChat workflow 
-    using Rust via extendr. Provides parallel Wilcoxon rank-sum testing with 
-    tie correction, HashSet-based gene filtering, and ligand-receptor pair 
-    matching as drop-in replacements for CellChat functions. Achieves up to 
-    183x speedup on Wilcoxon testing using Rayon parallelism.
+Description: Fast identification of over-expressed genes and
+    ligand-receptor interactions in single-cell RNA-seq data, the
+    pre-processing steps of cell-cell communication analysis tools such as
+    CellChat. Works directly on SummarizedExperiment and
+    SingleCellExperiment objects and accepts any ligand-receptor table
+    (for example the CellChatDB interaction table). The per-gene,
+    per-cell-group Wilcoxon rank-sum tests are implemented in Rust via
+    extendr and run in parallel with Rayon.
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.3
 Config/rextendr/version: 0.4.2
 SystemRequirements: Cargo (Rust's package manager), rustc >= 1.65.0, xz
 URL: https://github.com/mayankgandhi13/cellchatr
 BugReports: https://github.com/mayankgandhi13/cellchatr/issues
-biocViews: SingleCell, GeneExpression, Transcriptomics, StatisticalMethod,
-    Software
+biocViews: SingleCell, GeneExpression, Transcriptomics,
+    DifferentialExpression, Network, Software
 Depends: 
     R (>= 4.4.0)
 Imports:
-    methods
+    methods,
+    S4Vectors,
+    SummarizedExperiment
 Suggests: 
+    SingleCellExperiment,
+    Matrix,
+    BiocStyle,
     knitr,
     rmarkdown,
-    testthat (>= 3.0.0),
-    microbenchmark
+    testthat (>= 3.0.0)
 Config/testthat/edition: 3
 VignetteBuilder: knitr
+Config/roxygen2/version: 8.1.0

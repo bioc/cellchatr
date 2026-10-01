@@ -1,140 +1,97 @@
 # cellchatr
 
-An R package that accelerates [CellChat](https://github.com/jinworks/CellChat) 
-database querying using Rust via [extendr](https://extendr.github.io/).
+Fast identification of over-expressed genes and ligand-receptor (L-R)
+interactions in single-cell RNA-seq data, working directly on
+`SingleCellExperiment` / `SummarizedExperiment` objects. The per-gene,
+per-cell-group Wilcoxon tests are implemented in Rust
+([extendr](https://extendr.github.io/)) and run in parallel on all CPU cores.
 
-## Motivation
+## Who is it for?
 
-CellChat's gene filtering and statistical testing steps become serious 
-bottlenecks on large single-cell datasets. This package reimplements three 
-core functions in Rust — with parallel Wilcoxon testing via Rayon — and 
-exposes them to R as drop-in replacements.
+Analysts of single-cell RNA-seq data who want to find which L-R interactions
+are supported by over-expressed genes in their cell groups, either as a quick
+standalone screen or as a faster pre-filter before a full cell-cell
+communication analysis (e.g. with
+[CellChat](https://github.com/jinworks/CellChat)).
+
+## Relationship to CellChat
+
+cellchatr reimplements CellChat's pre-processing steps (gene subsetting,
+over-expressed gene detection, L-R matching), but it **does not depend on
+CellChat** and does not use CellChat objects:
+
+- Input is a `SingleCellExperiment`, `SummarizedExperiment` or a gene × cell
+  matrix.
+- The L-R database is any table with `ligand`, `receptor` and
+  `interaction_name` columns. CellChat's `CellChatDB.human$interaction` has
+  this layout and can be passed in as-is, but CellChat is optional.
+- CellChat is not listed in `DESCRIPTION` because it is distributed only on
+  GitHub.
 
 ## Installation
 
-### Via r-universe (recommended — no Rust required)
 ```r
-install.packages("cellchatr", 
-  repos = "https://mayankgandhi13.r-universe.dev")
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("cellchatr")
 ```
 
-### Via GitHub (requires Rust >= 1.65)
-```r
-devtools::install_github("mayankgandhi13/cellchatr", 
-  build_vignettes = TRUE)
-```
+Building from source requires Rust (`cargo`, `rustc`).
 
-## Quick Start
+## Quick start
 
 ```r
 library(cellchatr)
-library(CellChat)
 
-db <- CellChatDB.human
+# sce: a SingleCellExperiment with a "logcounts" assay and a
+#      "cell_type" column in colData
+# lrdb: a data.frame with ligand / receptor / interaction_name columns,
+#       e.g. CellChatDB.human$interaction
 
-# Step 1: filter expression genes to CellChatDB
-subset <- rust_subset_genes(expr_genes, db_genes)
-
-# Step 2: identify overexpressed genes per cell type (parallel Wilcoxon)
-overexpressed <- rust_wilcoxon_filter(
-  counts         = your_matrix,
-  labels         = cell_type_labels,
-  gene_names     = subset,
-  pval_threshold = 0.05
-)
-
-# Step 3: match to L-R pairs in CellChatDB
-interactions <- rust_match_lr_pairs(
-  overexpressed = overexpressed,
-  lr_ligands    = db$interaction$ligand,
-  lr_receptors  = db$interaction$receptor,
-  lr_names      = db$interaction$interaction_name
-)
+res <- identifyInteractions(sce, lrdb,
+                            labels = "cell_type",
+                            assay.type = "logcounts",
+                            pval_threshold = 0.05)
+res                          # DataFrame of matched interactions
+metadata(res)$overexpressed  # over-expressed genes
 ```
 
-See `vignette("cellchatr-workflow")` for a full worked example with 
-real `CellChatDB.human` data.
+Or step by step:
+
+```r
+oe <- findOverexpressedGenes(sce, labels = "cell_type", lrdb = lrdb)
+matchLRPairs(oe, lrdb)
+```
+
+See `vignette("cellchatr-workflow", package = "cellchatr")` for a full
+example.
 
 ## Functions
 
-### `rust_subset_genes(expr_genes, db_genes)`
-Filters expression matrix gene names to only those present in CellChatDB.
+| Function | Input | Output |
+|---|---|---|
+| `identifyInteractions()` | `SingleCellExperiment` / `SummarizedExperiment` / matrix + L-R table | `DataFrame` of interactions |
+| `findOverexpressedGenes()` | `SingleCellExperiment` / `SummarizedExperiment` / matrix (dense or sparse) | over-expressed genes |
+| `matchLRPairs()` | genes + L-R table | `DataFrame` of interactions |
+| `rust_wilcoxon_filter()`, `rust_subset_genes()`, `rust_match_lr_pairs()` | plain vectors / matrix | low-level Rust routines |
 
-- **Algorithm:** Rust `HashSet` lookup
-- **Complexity:** O(n + m) vs R's O(n × m)
-- **Replaces:** `subsetData()`
+**Statistics.** One-sided Wilcoxon rank-sum test (group vs. all other cells,
+alternative "greater"), normal approximation with tie correction and no
+continuity correction, equivalent to
+`wilcox.test(..., alternative = "greater", exact = FALSE, correct = FALSE)`.
+A gene is reported if it is significant in at least one group.
 
-### `rust_wilcoxon_filter(counts, labels, gene_names, pval_threshold)`
-Runs a one-sided Wilcoxon rank-sum test with tie correction for each 
-gene × cell type combination in parallel using Rayon.
+## Performance
 
-- **Algorithm:** Parallel Wilcoxon with average-rank tie correction
-- **Complexity:** O((g/p) × k × c log c) where p = CPU cores
-- **Replaces:** `identifyOverExpressedGenes()`
-
-### `rust_match_lr_pairs(overexpressed, lr_ligands, lr_receptors, lr_names)`
-Matches overexpressed genes against CellChatDB ligand-receptor pairs.
-An interaction is kept if its ligand OR receptor is overexpressed.
-
-- **Algorithm:** Rust `HashSet` lookup
-- **Complexity:** O(m + r) vs R's O(m × r)
-- **Replaces:** `identifyOverExpressedInteractions()`
-
-## Benchmarks
-
-Tested on MacBook Air M-series (aarch64-apple-darwin, 8 cores):
-
-### Wilcoxon filtering — the key bottleneck
-
-| Dataset | Rust | Base R | Speedup |
-|---|---|---|---|
-| 2,000 genes × 200 cells × 2 cell types | 4.5ms | 822ms | **183x** |
-| 2,000 genes × 200 cells × 2 cell types (vignette) | 57ms | 900ms | **16x** |
-| 10,000 genes × 500 cells × 5 cell types | 100ms | ~5.5 hrs (est.) | **>1000x** |
-
-### Gene lookup functions
-
-| Function | Rust | Base R | Note |
-|---|---|---|---|
-| `rust_subset_genes()` | 1.9ms | 0.29ms | R faster — FFI overhead dominates |
-| `rust_match_lr_pairs()` | 2.5ms | 0.38ms | R faster — FFI overhead dominates |
-
-> **Why Rust wins on Wilcoxon:** 50,000 independent statistical tests 
-> (10k genes × 5 cell types) run in parallel across all CPU cores. 
-> R runs them serially one by one.
-
-> **Why R wins on lookups:** R's internal C backend is already highly 
-> optimized for simple operations. The Rust FFI crossing cost outweighs 
-> the computation for small tasks.
-
-## Validation
-
-All three functions validated on real `CellChatDB.human` (3,233 L-R interactions):
-- `rust_subset_genes()` — correctly filters 15,462 → 1,462 CellChatDB genes
-- `rust_wilcoxon_filter()` — correctly detects TGFB1, TGFB2, TGFB3 as 
-  overexpressed in simulated Fibroblasts
-- `rust_match_lr_pairs()` — correctly maps 10 overexpressed genes to 89 
-  interactions across 13 pathways (COLLAGEN, TGFb, VEGF, SPP1...)
-
-## Tests
-
-```r
-devtools::test()
-# [ FAIL 0 | WARN 0 | SKIP 0 | PASS 16 ]
-```
-
-16 edge case tests covering empty inputs, boundary thresholds, 
-duplicate genes, and correct biological outputs.
+The Wilcoxon step is where the time goes: one test per gene per cell group.
+cellchatr runs these tests in parallel in Rust, and the vignette includes a
+reproducible timing comparison against an equivalent `wilcox.test()` loop.
+For the simple lookups, base R's `%in%` is already fast, so the Rust versions
+are not meant as speed-ups.
 
 ## Bioconductor
 
-Submitted to Bioconductor — Issue [#4283](https://github.com/Bioconductor/Contributions/issues/4283)
-
-## Requirements
-
-- R >= 4.4.0
-- Rust >= 1.65 (for building from source)
-- CellChat >= 2.0 (for real database access)
+Under review: [Bioconductor/Contributions #137](https://github.com/Bioconductor/Contributions/issues/137)
 
 ## License
 

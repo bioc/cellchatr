@@ -1,6 +1,9 @@
 ---
-title: "cellchatr: Fast CellChat Database Querying with Rust"
-output: rmarkdown::html_vignette
+title: "cellchatr: fast ligand-receptor pre-filtering for single-cell data"
+author: "Mayank Gandhi"
+output:
+  BiocStyle::html_document:
+    toc: true
 vignette: >
   %\VignetteIndexEntry{cellchatr-workflow}
   %\VignetteEngine{knitr::rmarkdown}
@@ -14,153 +17,208 @@ knitr::opts_chunk$set(
 )
 ```
 
-## Overview
+# Introduction
 
-`cellchatr` accelerates three bottleneck steps in the CellChat workflow 
-using Rust via extendr. This vignette shows a complete pipeline using 
-synthetic ligand-receptor data representative of a CellChat-style database.
+Cell-cell communication tools such as
+[CellChat](https://github.com/jinworks/CellChat) start with the same
+pre-processing:
 
-The three functions replace:
+1. restrict the expression data to genes in a ligand-receptor (L-R) database,
+2. find genes over-expressed in each cell group (one Wilcoxon test per gene
+   and per group), and
+3. keep the L-R interactions whose ligand or receptor is over-expressed.
 
-| cellchatr | CellChat | Speedup |
-|---|---|---|
-| `rust_subset_genes()` | `subsetData()` | O(n+m) vs O(n×m) |
-| `rust_wilcoxon_filter()` | `identifyOverExpressedGenes()` | 183x faster |
-| `rust_match_lr_pairs()` | `identifyOverExpressedInteractions()` | O(m+r) vs O(m×r) |
+Step 2 dominates the run time on large datasets, because the number of tests
+grows with genes × cell groups and they run one at a time in R.
+`r Biocpkg("cellchatr")` implements these steps in Rust and runs the tests in
+parallel on all CPU cores.
 
-## Setup
+**Intended users.** Analysts working with single-cell RNA-seq data in
+`r Biocpkg("SingleCellExperiment")` or `r Biocpkg("SummarizedExperiment")`
+objects who want to find over-expressed L-R interactions between cell
+groups, either as a quick standalone screen or as a faster pre-filter before
+a full communication analysis.
 
-```{r setup}
+**Relationship to CellChat.** `r Biocpkg("cellchatr")` does **not** depend on
+CellChat and does not use CellChat objects. It takes any L-R table with
+`ligand`, `receptor` and `interaction_name` columns. The `interaction` table
+of `CellChatDB.human` / `CellChatDB.mouse` has exactly this layout, so
+CellChat users can pass it in directly (see
+[Using CellChatDB](#using-cellchatdb)), but CellChat is only an optional
+source of an L-R database. It is not listed in `DESCRIPTION` because it is
+distributed only through GitHub, which Bioconductor does not allow as a
+dependency.
+
+# Installation
+
+```{r install, eval = FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
+BiocManager::install("cellchatr")
+```
+
+Binary packages do not need Rust. Building from source requires `cargo` and
+`rustc` (see `SystemRequirements` in `DESCRIPTION`).
+
+# Example with a SingleCellExperiment
+
+```{r setup, message = FALSE}
 library(cellchatr)
+library(SingleCellExperiment)
 ```
 
-## Synthetic Ligand-Receptor Database
+## A small ligand-receptor table
 
-We construct a small synthetic L-R database representative of a 
-CellChat-style interaction table. In practice, users can supply 
-their own L-R database in the same format.
-
-```{r build-db}
-set.seed(42)
-
-ligands   <- c("TGFB1", "VEGFA", "CXCL12", "IL6", "TNF",
-               "MIF",   "CCL2",  "PDGFB",  "EGF", "FGF2")
-receptors <- c("TGFBR1", "FLT1",   "CXCR4", "IL6R",  "TNFRSF1A",
-               "CD74",   "CCR2",   "PDGFRB", "EGFR",  "FGFR1")
-pathways  <- c("TGFb", "VEGF", "CXCL", "IL6", "TNF",
-               "MIF",  "CCL",  "PDGF", "EGF", "FGF")
-
-db <- data.frame(
-  interaction_name = paste0(ligands, "_", receptors),
-  ligand           = ligands,
-  receptor         = receptors,
-  pathway_name     = pathways,
-  stringsAsFactors = FALSE
+```{r lrdb}
+lrdb <- data.frame(
+    interaction_name = c("TGFB1_TGFBR1", "VEGFA_FLT1", "CXCL12_CXCR4",
+                         "IL6_IL6R", "TNF_TNFRSF1A", "MIF_CD74",
+                         "CCL2_CCR2", "PDGFB_PDGFRB", "EGF_EGFR",
+                         "FGF2_FGFR1"),
+    ligand = c("TGFB1", "VEGFA", "CXCL12", "IL6", "TNF",
+               "MIF", "CCL2", "PDGFB", "EGF", "FGF2"),
+    receptor = c("TGFBR1", "FLT1", "CXCR4", "IL6R", "TNFRSF1A",
+                 "CD74", "CCR2", "PDGFRB", "EGFR", "FGFR1"),
+    pathway_name = c("TGFb", "VEGF", "CXCL", "IL6", "TNF",
+                     "MIF", "CCL", "PDGF", "EGF", "FGF")
 )
-
-cat("Total L-R interactions:", nrow(db), "\n")
-cat("Signaling pathways:", length(unique(db$pathway_name)), "\n")
-head(db)
+lrdb
 ```
 
-## Step 1 — Subset Expression Genes to Database (`rust_subset_genes`)
+## Simulated data
 
-```{r subset-genes}
-expr_genes <- unique(c(
-  paste0("GENE", 1:14000),
-  db$ligand,
-  db$receptor
-))
-cat("Total genes in expression matrix:", length(expr_genes), "\n")
+We simulate log-normalized expression for 2,000 genes in 300 cells from
+three cell types. TGFB1 and PDGFB are made higher in fibroblasts, and FLT1
+higher in endothelial cells.
 
-db_genes <- unique(c(db$ligand, db$receptor))
-cat("Genes in L-R database:", length(db_genes), "\n")
-
-subset_genes <- rust_subset_genes(expr_genes, db_genes)
-cat("Genes present in both:", length(subset_genes), "\n")
-head(subset_genes)
-```
-
-## Step 2 — Identify Overexpressed Genes (`rust_wilcoxon_filter`)
-
-Parallel Wilcoxon rank-sum test across all genes and cell types.
-Uses Rayon for multi-core parallelism — 183x faster than base R.
-
-```{r wilcoxon-filter}
+```{r sce}
 set.seed(42)
+genes <- unique(c(lrdb$ligand, lrdb$receptor, paste0("GENE", 1:2000)))
+cell_type <- rep(c("Fibroblast", "Macrophage", "Endothelial"), each = 100)
 
-n_genes <- length(subset_genes)
-n_cells <- 300
-labels  <- c(rep("Fibroblast", 100), rep("Macrophage", 100),
-             rep("Endothelial", 100))
+mat <- matrix(rnorm(length(genes) * length(cell_type), mean = 1, sd = 1),
+              nrow = length(genes),
+              dimnames = list(genes, paste0("cell", seq_along(cell_type))))
+mat[c("TGFB1", "PDGFB"), cell_type == "Fibroblast"] <-
+    mat[c("TGFB1", "PDGFB"), cell_type == "Fibroblast"] + 3
+mat["FLT1", cell_type == "Endothelial"] <-
+    mat["FLT1", cell_type == "Endothelial"] + 3
 
-counts <- matrix(rnorm(n_genes * n_cells, mean = 1, sd = 1), nrow = n_genes)
-counts[1:5, labels == "Fibroblast"] <-
-  counts[1:5, labels == "Fibroblast"] + 5
-
-overexpressed <- rust_wilcoxon_filter(counts, labels, subset_genes, 0.05)
-
-cat("Overexpressed genes found:", length(overexpressed), "\n")
-head(overexpressed)
-```
-
-## Step 3 — Match to L-R Pairs (`rust_match_lr_pairs`)
-
-HashSet-based matching — O(m + r) vs R's O(m × r).
-
-```{r match-lr}
-interactions <- rust_match_lr_pairs(
-  overexpressed = overexpressed,
-  lr_ligands    = db$ligand,
-  lr_receptors  = db$receptor,
-  lr_names      = db$interaction_name
+sce <- SingleCellExperiment(
+    assays = list(logcounts = mat),
+    colData = DataFrame(cell_type = cell_type)
 )
-
-cat("Matched L-R interactions:", length(interactions), "\n")
-
-matched <- db[db$interaction_name %in% interactions,
-              c("interaction_name", "ligand", "receptor", "pathway_name")]
-print(matched)
+sce
 ```
 
-## Benchmark
+## One-call workflow
 
-```{r benchmark, message=FALSE}
-library(microbenchmark)
+`identifyInteractions()` restricts the data to L-R genes, tests every gene
+in every cell type, and returns the matching interactions as a
+`DataFrame`. No multiple-testing correction is applied, so we use a strict
+p-value cutoff:
 
+```{r identify}
+res <- identifyInteractions(sce, lrdb, labels = "cell_type",
+                            assay.type = "logcounts",
+                            pval_threshold = 1e-6)
+res
+metadata(res)$overexpressed
+```
+
+## Step by step
+
+The steps can also be run separately:
+
+```{r steps}
+oe <- findOverexpressedGenes(sce, labels = "cell_type", lrdb = lrdb,
+                             pval_threshold = 1e-6)
+oe
+matchLRPairs(oe, lrdb)
+```
+
+`findOverexpressedGenes()` also accepts a plain or sparse matrix with gene
+names as row names:
+
+```{r matrix}
+findOverexpressedGenes(Matrix::Matrix(mat, sparse = TRUE),
+                       labels = cell_type, lrdb = lrdb,
+                       pval_threshold = 1e-6)
+```
+
+# Using CellChatDB {#using-cellchatdb}
+
+If CellChat is installed, its database can be used as-is:
+
+```{r cellchatdb, eval = FALSE}
+library(CellChat)
+res <- identifyInteractions(sce, CellChatDB.human$interaction,
+                            labels = "cell_type")
+```
+
+Ligands and receptors are matched by name. CellChatDB entries that refer to
+multi-subunit complexes are only matched if the complex name itself is
+among the over-expressed genes.
+
+# Statistical details
+
+For each gene and each cell group, a one-sided Wilcoxon rank-sum test
+compares the cells in the group against all other cells (alternative:
+higher in the group). P-values use the normal approximation with
+tie-corrected variance and no continuity correction, matching
+`wilcox.test(x, y, alternative = "greater", exact = FALSE, correct = FALSE)`:
+
+```{r compare}
+x <- mat["TGFB1", cell_type == "Fibroblast"]
+y <- mat["TGFB1", cell_type != "Fibroblast"]
+wilcox.test(x, y, alternative = "greater",
+            exact = FALSE, correct = FALSE)$p.value
+```
+
+A gene is reported if its p-value is below `pval_threshold` in at least one
+group. No multiple-testing correction is applied.
+
+# Performance
+
+The low-level functions `rust_subset_genes()`, `rust_wilcoxon_filter()` and
+`rust_match_lr_pairs()` work on plain vectors and matrices. Here we compare
+`rust_wilcoxon_filter()` with an equivalent loop over `wilcox.test()`:
+
+```{r benchmark}
 set.seed(42)
-n_genes    <- 2000
-n_cells    <- 200
-labels_bm  <- c(rep("A", 100), rep("B", 100))
-gene_names <- paste0("GENE", 1:n_genes)
-counts_bm  <- matrix(rnorm(n_genes * n_cells), nrow = n_genes)
+n_genes <- 500
+labels_bm <- rep(c("A", "B"), each = 100)
+counts_bm <- matrix(rnorm(n_genes * 200), nrow = n_genes)
+gene_names <- paste0("GENE", seq_len(n_genes))
 
 r_wilcoxon <- function(counts, labels, gene_names, pval_threshold) {
-  cell_types    <- unique(labels)
-  overexpressed <- c()
-  for (g in 1:nrow(counts)) {
-    for (ct in cell_types) {
-      group <- counts[g, labels == ct]
-      other <- counts[g, labels != ct]
-      p <- wilcox.test(group, other, alternative = "greater")$p.value
-      if (p < pval_threshold) {
-        overexpressed <- c(overexpressed, gene_names[g])
-        break
-      }
-    }
-  }
-  overexpressed
+    hit <- vapply(seq_len(nrow(counts)), function(g) {
+        any(vapply(unique(labels), function(ct) {
+            wilcox.test(counts[g, labels == ct], counts[g, labels != ct],
+                        alternative = "greater", exact = FALSE,
+                        correct = FALSE)$p.value < pval_threshold
+        }, logical(1)))
+    }, logical(1))
+    gene_names[hit]
 }
 
-bm <- microbenchmark(
-  rust   = rust_wilcoxon_filter(counts_bm, labels_bm, gene_names, 0.05),
-  base_r = r_wilcoxon(counts_bm, labels_bm, gene_names, 0.05),
-  times  = 3
+t_rust <- system.time(
+    rust_res <- rust_wilcoxon_filter(counts_bm, labels_bm, gene_names, 0.05)
 )
-print(bm)
+t_r <- system.time(
+    r_res <- r_wilcoxon(counts_bm, labels_bm, gene_names, 0.05)
+)
+identical(sort(rust_res), sort(r_res))
+c(rust = t_rust[["elapsed"]], base_r = t_r[["elapsed"]])
 ```
 
-## Session Info
+Speed-ups depend on the number of CPU cores and grow with the number of
+genes and cell groups. For the simple lookups (`rust_subset_genes()`,
+`rust_match_lr_pairs()`), base R's `%in%` is already fast, and the Rust
+versions are provided mainly so the whole workflow runs in one place.
+
+# Session info
 
 ```{r session-info}
 sessionInfo()
